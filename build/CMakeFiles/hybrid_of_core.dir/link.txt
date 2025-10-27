@@ -1,0 +1,2 @@
+/usr/bin/ar qc libhybrid_of_core.a CMakeFiles/hybrid_of_core.dir/src/te_controller.cpp.o CMakeFiles/hybrid_of_core.dir/src/topo_viewer.cpp.o CMakeFiles/hybrid_of_core.dir/src/monitor.cpp.o CMakeFiles/hybrid_of_core.dir/src/forecast.cpp.o CMakeFiles/hybrid_of_core.dir/src/actuator.cpp.o
+/usr/bin/ranlib libhybrid_of_core.a

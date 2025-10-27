@@ -1,0 +1,2 @@
+/usr/bin/ar qc libmilp_te.a CMakeFiles/milp_te.dir/src/milp_te.cpp.o
+/usr/bin/ranlib libmilp_te.a
