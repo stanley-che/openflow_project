@@ -19,13 +19,15 @@
 #include <thread>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <cerrno>
-#include<sstream>
+#include <sstream>
+#include <algorithm>
 using namespace std;
+
 // Minimal definitions so the linker can find them.
 OFController::OFController() : impl_(nullptr) {}
 OFController::~OFController() {}
-
 
 // -----------------------------
 // OpenFlow 1.0 wire structures
@@ -49,6 +51,12 @@ struct ofp_switch_features {
   uint8_t  n_tables; uint8_t pad[3];
   uint32_t capabilities;
   uint32_t actions;
+};
+
+struct ofp_switch_config {
+  ofp_header header;
+  uint16_t flags;
+  uint16_t miss_send_len;
 };
 
 struct ofp_match {
@@ -101,6 +109,8 @@ struct ofp_packet_out {
   uint32_t buffer_id;
   uint16_t in_port;
   uint16_t actions_len;
+  // actions...
+  // payload...
 };
 
 struct ofp_packet_in {
@@ -147,7 +157,7 @@ struct ofp_port_mod {
 };
 
 enum { OFPPC_PORT_DOWN = 1<<0 };
-enum { OFPP_NONE = 0xffff, OFPP_CONTROLLER = 0xfffd };
+enum { OFPP_NONE = 0xffff, OFPP_CONTROLLER = 0xfffd, OFPP_FLOOD = 0xfffb };
 enum {
   OFPPF_10MB_HD  = 1<<0,  OFPPF_10MB_FD  = 1<<1,
   OFPPF_100MB_HD = 1<<2,  OFPPF_100MB_FD = 1<<3,
@@ -172,14 +182,16 @@ static uint32_t advertise_mask_for_speed(int speedMbps){
   if(speedMbps>=10)    return OFPPF_10MB_FD;
   return 0;
 }
+static string mac_to_key(const uint8_t m[6]){
+  char buf[32]; snprintf(buf,sizeof(buf),"%02x:%02x:%02x:%02x:%02x:%02x",m[0],m[1],m[2],m[3],m[4],m[5]);
+  return string(buf);
+}
 
 // =============================
 // class OFController (impl.)
 // =============================
 class OFControllerImpl {
 public:
-	// --- wire up the header's ctor/dtor so the linker can find them ---
-
   std::atomic<uint32_t> xid{1};
   std::mutex mtx;
   std::thread loop_thread;
@@ -190,10 +202,13 @@ public:
     int fd{-1};
     uint64_t dpid{0};
     std::map<int/*port*/, ofp_port_stats> last_ps;
+    // 簡易 L2 學習表：mac -> port
+    std::unordered_map<std::string,int> mac2port;
   };
   std::map<int,int> sw_index_to_fd; // sw index (1..N) -> fd
   std::map<int, SwCtx> sw;          // fd -> ctx
 
+  // --- send helpers ---
   static void send_all(int fd, const void* buf, size_t len){
     const uint8_t* p=(const uint8_t*)buf; size_t off=0;
     while(off<len){
@@ -221,6 +236,17 @@ public:
     h.length=htobe16_u(sizeof(h)); h.xid=htobe32_u(xid++);
     send_all(fd,&h,sizeof(h));
   }
+  void send_get_config_req(int fd){
+    ofp_header h{}; h.version=OFP_VERSION; h.type=OFPT_GET_CONFIG_REQUEST;
+    h.length=htobe16_u(sizeof(h)); h.xid=htobe32_u(xid++);
+    send_all(fd,&h,sizeof(h));
+  }
+  void send_set_config(int fd, uint16_t flags/*=0*/, uint16_t miss/*=0xffff*/){
+    ofp_switch_config c{}; c.header.version=OFP_VERSION; c.header.type=OFPT_SET_CONFIG;
+    c.flags=htobe16_u(flags); c.miss_send_len=htobe16_u(miss);
+    c.header.length=htobe16_u(sizeof(c)); c.header.xid=htobe32_u(xid++);
+    send_all(fd,&c,sizeof(c));
+  }
   void send_echo_reply(int fd, const ofp_header* req, const uint8_t* payload, size_t len){
     std::vector<uint8_t> buf(sizeof(ofp_header)+len);
     auto* h=(ofp_header*)buf.data(); h->version=OFP_VERSION; h->type=OFPT_ECHO_REPLY;
@@ -247,8 +273,8 @@ public:
     { std::vector<uint8_t> v; v.push_back(5); v.push_back(uint8_t(port_no>>8)); v.push_back(uint8_t(port_no));
       uint16_t tl=(2<<9)|(uint16_t(v.size())&0x1ff); push16(tl); f.insert(end(f),begin(v),end(v));
     }
-    { push16((3<<9)|2); push16(120); }
-    { push16(0); }
+    { push16((3<<9)|2); push16(120); } // TTL
+    { push16(0); } // End TLV
     if(f.size()<14+46) f.resize(14+46,0);
     return f;
   }
@@ -268,6 +294,22 @@ public:
     memcpy(buf.data()+sizeof(po),&act,sizeof(act));
     memcpy(buf.data()+sizeof(po)+sizeof(act),frame.data(),frame.size());
     send_all(fd,buf.data(),buf.size());
+  }
+
+  void send_packet_out_with_buffer(int fd, uint32_t buffer_id, uint16_t in_port, uint16_t out_port){
+    ofp_action_output act{htobe16_u(OFPAT_OUTPUT),htobe16_u(sizeof(ofp_action_output)),
+                          htobe16_u(out_port),htobe16_u(0)};
+    ofp_packet_out po{};
+    po.header.version=OFP_VERSION; po.header.type=OFPT_PACKET_OUT;
+    po.buffer_id=htobe32_u(buffer_id);
+    po.in_port = htobe16_u(in_port);
+    po.actions_len = htobe16_u(sizeof(act));
+    po.header.length = htobe16_u(sizeof(po)+sizeof(act));
+    po.header.xid = htobe32_u(xid++);
+    std::vector<uint8_t> buf(sizeof(po)+sizeof(act));
+    memcpy(buf.data(), &po, sizeof(po));
+    memcpy(buf.data()+sizeof(po), &act, sizeof(act));
+    send_all(fd, buf.data(), buf.size());
   }
 
   void send_port_stats_req(int fd, uint16_t port = 0xffff){
@@ -292,6 +334,9 @@ public:
       bool exists=false; for(auto& kv: sw_index_to_fd) if(kv.second==fd) exists=true;
       if(!exists) sw_index_to_fd[maxIdx+1]=fd;
     }
+    // 設定 miss_send_len，否則 PACKET_IN 不會帶 payload
+    send_set_config(fd, /*flags*/0, /*miss*/0xffff);
+    send_get_config_req(fd);
   }
 
   void on_stats_reply(int fd, const ofp_stats_reply* r){
@@ -306,7 +351,65 @@ public:
       off += sizeof(ofp_port_stats);
     }
   }
-  void on_packet_in(int /*fd*/, const ofp_packet_in* /*pi*/){}
+
+  void on_packet_in(int fd, const ofp_packet_in* pi){
+    const uint8_t* frame = pi->data;
+    if(ntohs(pi->total_len) < 14) return;
+    const uint8_t* dst = frame+0;
+    const uint8_t* src = frame+6;
+    uint16_t eth_type = (frame[12]<<8) | frame[13];
+    uint16_t in_port = ntohs(pi->in_port);
+
+    // 學習來源 MAC -> in_port
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      sw[fd].mac2port[mac_to_key(src)] = in_port;
+    }
+
+    // 查目的 MAC 是否已知
+    int out_port = -1;
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      auto it = sw[fd].mac2port.find(mac_to_key(dst));
+      if(it != sw[fd].mac2port.end()) out_port = it->second;
+    }
+
+    // 已知 → 安裝單向 flow 並轉送；未知 → FLOOD
+    if(out_port > 0 && out_port != in_port){
+      // 安裝 flow: match in_port + dl_dst，動作 output:out_port
+      ofp_flow_mod fm{}; fm.header.version=OFP_VERSION; fm.header.type=OFPT_FLOW_MOD;
+      fm.cookie      = htobe64_u(0x1ULL);
+      fm.command     = htobe16_u(OFPFC_ADD);
+      fm.idle_timeout= htobe16_u(30);
+      fm.hard_timeout= htobe16_u(0);
+      fm.priority    = htobe16_u(100);
+      fm.buffer_id   = pi->buffer_id;                // 讓 switch 直接轉出這個封包
+      fm.out_port    = htobe16_u(0xffff);
+      fm.flags       = htobe16_u(0);
+
+      memset(&fm.match, 0, sizeof(fm.match));
+      fm.match.in_port = htobe16_u(in_port);
+      fm.match.dl_type = 0; // 只匹配 L2
+      memcpy(fm.match.dl_dst, dst, 6);
+      uint32_t wc = OFPFW_DL_VLAN | OFPFW_DL_SRC | OFPFW_DL_VLAN_PCP |
+                    OFPFW_DL_TYPE | OFPFW_NW_TOS | OFPFW_NW_PROTO |
+                    OFPFW_TP_SRC  | OFPFW_TP_DST; // 只指定 in_port + dl_dst
+      fm.match.wildcards = htonl(wc);
+
+      ofp_action_output act{htobe16_u(OFPAT_OUTPUT), htobe16_u(sizeof(ofp_action_output)),
+                            htobe16_u(uint16_t(out_port)), htobe16_u(0)};
+      const size_t len = sizeof(fm) + sizeof(act);
+      fm.header.length = htobe16_u(len);
+      fm.header.xid    = htobe32_u(xid++);
+      std::vector<uint8_t> buf(len);
+      memcpy(buf.data(), &fm, sizeof(fm));
+      memcpy(buf.data()+sizeof(fm), &act, sizeof(act));
+      send_all(fd, buf.data(), buf.size());
+    } else {
+      // 未知 → FLOOD（使用 buffer_id，避免攜帶 payload）
+      send_packet_out_with_buffer(fd, pi->buffer_id, in_port, OFPP_FLOOD);
+    }
+  }
 
   void loop(uint16_t port){
     listen_fd = listen_on(port);
@@ -333,34 +436,57 @@ public:
           sw[cfd] = SwCtx{cfd,0,{}};
           send_hello(cfd);
           send_features_req(cfd);
+          // 提前設 config，某些 switch 會在 features 之前也允許
+          send_set_config(cfd, 0, 0xffff);
         }
       }
 
       std::vector<int> closed;
+
+      // ---- 收包（修正：把 header+body 併成一塊解析）----
       {
         std::lock_guard<std::mutex> lk(mtx);
         for(auto& kv: sw){
           int fd=kv.first;
           if(!FD_ISSET(fd,&rfds)) continue;
-          ofp_header h{}; ssize_t n=recv(fd,&h,sizeof(h),MSG_WAITALL);
+
+          ofp_header h{};
+          ssize_t n=recv(fd,&h,sizeof(h),MSG_WAITALL);
           if(n<=0){ closed.push_back(fd); continue; }
           if(n != (ssize_t)sizeof(h) || h.version!=OFP_VERSION){ closed.push_back(fd); continue; }
+
           uint16_t mlen = ntohs(h.length);
-          std::vector<uint8_t> body(mlen - sizeof(h));
-          if(!body.empty()){
-            ssize_t m=recv(fd, body.data(), body.size(), MSG_WAITALL);
+          if(mlen < sizeof(ofp_header)){ closed.push_back(fd); continue; }
+          std::vector<uint8_t> full(mlen);
+          memcpy(full.data(), &h, sizeof(h));
+          if(mlen > sizeof(h)){
+            ssize_t m=recv(fd, full.data()+sizeof(h), mlen - sizeof(h), MSG_WAITALL);
             if(m<=0){ closed.push_back(fd); continue; }
           }
-          switch(h.type){
+
+          auto* base = (const ofp_header*)full.data();
+          switch(base->type){
             case OFPT_HELLO: break;
-            case OFPT_ECHO_REQUEST: send_echo_reply(fd,&h, body.data(), body.size()); break;
-            case OFPT_FEATURES_REPLY: on_features_reply(fd,(const ofp_switch_features*)&h); break;
-            case OFPT_PACKET_IN: on_packet_in(fd,(const ofp_packet_in*)&h); break;
-            case OFPT_STATS_REPLY: on_stats_reply(fd,(const ofp_stats_reply*)&h); break;
+            case OFPT_ECHO_REQUEST: {
+              const uint8_t* payload = full.data()+sizeof(ofp_header);
+              size_t plen = mlen - sizeof(ofp_header);
+              send_echo_reply(fd, base, payload, plen);
+              break;
+            }
+            case OFPT_FEATURES_REPLY:
+              on_features_reply(fd, (const ofp_switch_features*)base);
+              break;
+            case OFPT_PACKET_IN:
+              on_packet_in(fd, (const ofp_packet_in*)base);
+              break;
+            case OFPT_STATS_REPLY:
+              on_stats_reply(fd,(const ofp_stats_reply*)base);
+              break;
             default: break;
           }
         }
       }
+
       if(!closed.empty()){
         std::lock_guard<std::mutex> lk(mtx);
         for(int fd: closed){ close(fd); sw.erase(fd);
@@ -435,7 +561,6 @@ std::map<LinkId,PortStats> OFController::poll_port_stats(){
   return out;
 }
 
-// 取代你目前的 OFController::flow_mod(...)
 void OFController::flow_mod(int swid,
                             const std::string& match,
                             const std::string& actions,
@@ -445,7 +570,6 @@ void OFController::flow_mod(int swid,
                             std::optional<uint16_t> hard_timeout,
                             std::optional<uint64_t> cookie)
 {
-  // 只支援簡化的 IPv4 五元組文字格式（與先前版本相同）
   auto parse_ip = [](const std::string& s)->uint32_t {
     in_addr a{}; if(inet_aton(s.c_str(), &a)==0) return 0; return a.s_addr;
   };
@@ -455,13 +579,11 @@ void OFController::flow_mod(int swid,
   uint32_t src=0, dst=0;
   std::optional<uint16_t> sport, dport;
 
-  // 很簡單的 key=value 擷取器（在 match 字串內找第一個片段）
   auto eat = [&](const std::string& k, std::string* v)->bool{
     auto pos = match.find(k);
     if (pos == std::string::npos) return false;
     auto p2 = match.find_first_of(", ", pos + k.size());
-    *v = match.substr(pos + k.size(),
-                      p2 == std::string::npos ? std::string::npos : (p2 - (pos + k.size())));
+    *v = match.substr(pos + k.size(), p2 == std::string::npos ? std::string::npos : (p2 - (pos + k.size())));
     return true;
   };
 
@@ -472,13 +594,9 @@ void OFController::flow_mod(int swid,
   if (eat("proto=",&v) || eat("nw_proto=",&v)) proto = uint8_t(std::stoi(v));
   if (eat("sport=",&v) || eat("tp_src=",  &v)) if(v!="-") sport = uint16_t(std::stoi(v));
   if (eat("dport=",&v) || eat("tp_dst=",  &v)) if(v!="-") dport = uint16_t(std::stoi(v));
-  if (actions.rfind("output:",0) == 0) {
-  	out_port = uint16_t(std::stoi(actions.substr(7)));
-  	} else if (actions.rfind("output=",0) == 0) {
-    out_port = uint16_t(std::stoi(actions.substr(7)));
-  }
+  if (actions.rfind("output:",0) == 0)       out_port = uint16_t(std::stoi(actions.substr(7)));
+  else if (actions.rfind("output=",0) == 0)  out_port = uint16_t(std::stoi(actions.substr(7)));
 
-  // 送出 FLOW_MOD
   auto send_flow = [&](int fd){
     ofp_flow_mod fm{}; fm.header.version=OFP_VERSION; fm.header.type=OFPT_FLOW_MOD;
     fm.cookie      = htobe64_u(cookie.value_or(0x1234ULL));
@@ -490,7 +608,6 @@ void OFController::flow_mod(int swid,
     fm.out_port    = htobe16_u(0xffff);
     fm.flags       = htobe16_u(0);
 
-    // match
     memset(&fm.match, 0, sizeof(fm.match));
     fm.match.in_port = htobe16_u(in_port);
     fm.match.dl_type = htobe16_u(0x0800);
@@ -511,7 +628,7 @@ void OFController::flow_mod(int swid,
                           htobe16_u(out_port), htobe16_u(0)};
     const size_t len = sizeof(fm) + (add ? sizeof(act) : 0);
     fm.header.length = htobe16_u(len);
-    fm.header.xid    = htobe32_u(g_impl.xid++);// or g_impl.xid++
+    fm.header.xid    = htobe32_u(g_impl.xid++);
 
     std::vector<uint8_t> buf(len);
     memcpy(buf.data(), &fm, sizeof(fm));
@@ -551,7 +668,6 @@ void OFController::packet_out(int swid, int out_port, const uint8_t* eth, size_t
   OFControllerImpl::send_all(fd, buf.data(), buf.size());
 }
 
-
 void OFController::barrier(int swid){
   std::lock_guard<std::mutex> lk(g_impl.mtx);
   auto it = g_impl.sw_index_to_fd.find(swid);
@@ -567,7 +683,6 @@ std::map<int, PortStats> OFController::poll_port_stats(int swid){
   int fd = it->second;
 
   g_impl.send_port_stats_req(fd, 0xffff);
-  // 簡單 sleep 等回來（或可由背景 loop 回呼處理）
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
 
   auto sit = g_impl.sw.find(fd);
@@ -597,29 +712,13 @@ std::string OFController::ip_match(int in_port,
   return ss.str();
 }
 
-
 // =============================
 // Extra public methods needed by TopoViewer / Monitor
 // =============================
+void OFController::on_lldp(OnLLDP cb) { std::lock_guard<std::mutex> lk(mtx_); cb_lldp_ = std::move(cb); }
+void OFController::set_lldp_period(std::chrono::milliseconds p) { std::lock_guard<std::mutex> lk(mtx_); lldp_period_ = p; }
+void OFController::set_stats_period(std::chrono::milliseconds p){ std::lock_guard<std::mutex> lk(mtx_); stats_period_ = p; }
 
-void OFController::on_lldp(OnLLDP cb) {
-  std::lock_guard<std::mutex> lk(mtx_);
-  cb_lldp_ = std::move(cb);
-}
-
-void OFController::set_lldp_period(std::chrono::milliseconds p) {
-  std::lock_guard<std::mutex> lk(mtx_);
-  lldp_period_ = p;
-  // 目前 g_impl.loop() 里是固定 2s/3s 的定时，若要真正生效可将 loop 中的常数改用 lldp_period_
-}
-
-void OFController::set_stats_period(std::chrono::milliseconds p) {
-  std::lock_guard<std::mutex> lk(mtx_);
-  stats_period_ = p;
-  // 同上：要让 loop 用这个周期，需要把 loop 里对 last_stats 的比较改成用 stats_period_
-}
-
-// 列出当前已连接的 switch 索引（swid）
 std::vector<int> OFController::switch_ids() const {
   std::vector<int> ids;
   std::lock_guard<std::mutex> lk(g_impl.mtx);
@@ -628,7 +727,6 @@ std::vector<int> OFController::switch_ids() const {
   return ids;
 }
 
-// 返回特定 sw 的端口号列表（根据最近的 PORT_STATS 缓存）
 std::vector<int> OFController::ports_of(int swid) const {
   std::vector<int> ports;
   std::lock_guard<std::mutex> lk(g_impl.mtx);
@@ -643,7 +741,6 @@ std::vector<int> OFController::ports_of(int swid) const {
   return ports;
 }
 
-// 可选：若别处会用到 switch_info()，提供一个基本实现
 std::optional<SwitchInfo> OFController::switch_info(int swid) const {
   std::lock_guard<std::mutex> lk(g_impl.mtx);
   auto it = g_impl.sw_index_to_fd.find(swid);
@@ -659,7 +756,6 @@ std::optional<SwitchInfo> OFController::switch_info(int swid) const {
   for (const auto& kv : sit->second.last_ps) {
     PortInfo pi{};
     pi.port_no = kv.first;
-    // 这里只能给出已知的 last stats，up/speed 无法仅由 PORT_STATS 确定
     pi.up = true;
     pi.curr_speedMbps = 0;
     const auto& ps = kv.second;
@@ -670,7 +766,6 @@ std::optional<SwitchInfo> OFController::switch_info(int swid) const {
   }
   return info;
 }
-
 
 void OFController::port_mod(int swid, int port_no, bool up, int speedMbps){
   std::lock_guard<std::mutex> lk(g_impl.mtx);
@@ -690,7 +785,6 @@ void OFController::port_mod(int swid, int port_no, bool up, int speedMbps){
   g_impl.send_barrier(fd);
 }
 
-// 可選：若 .hpp 有宣告 stop()
 void OFController::stop(){
   if(!g_impl.running) return;
   g_impl.running=false;

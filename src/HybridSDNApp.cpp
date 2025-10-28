@@ -32,6 +32,16 @@ void HybridSDNApp::run() {
   if (!ctl_.start(of_port_)) {
     throw std::runtime_error("Failed to start OpenFlow controller");
   }
+std::cerr << "[HybridOF] reading topo: " << paths_.graph_json << "\n";
+std::cerr << "[HybridOF] nodes=" << runtime_graph_.nodes.size()
+          << " links=" << runtime_graph_.cap_mbps.size()
+          << " sdn=" << runtime_graph_.sdn_nodes.size() << "\n";
+
+if (!ctl_.start(of_port_)) {
+  throw std::runtime_error("Failed to start OpenFlow controller");
+}
+std::cerr << "[HybridOF] listening on 0.0.0.0:" << of_port_ << "\n";
+
   topo_.start();
   mon_.start();
 
